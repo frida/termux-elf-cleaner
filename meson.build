@@ -9,4 +9,6 @@ sources = [
   'elf-cleaner.cpp',
   'arghandling.c',
 ]
-executable('termux-elf-cleaner', sources, install : true)
+elf_cleaner = executable('termux-elf-cleaner', sources, install : true)
+
+meson.override_find_program('termux-elf-cleaner', elf_cleaner)
