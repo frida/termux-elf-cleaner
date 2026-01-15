@@ -20,14 +20,21 @@ along with termux-elf-cleaner.  If not, see
 <https://www.gnu.org/licenses/>.  */
 
 #include <algorithm>
-#include <fcntl.h>
+#include <cstdint>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+# define NOMINMAX
+# include <windows.h>
+#else
+# include <fcntl.h>
+# include <sys/mman.h>
+# include <sys/stat.h>
+# include <sys/types.h>
+# include <unistd.h>
+#endif
 
 #include "arghandling.h"
 
@@ -201,102 +208,213 @@ bool process_elf(uint8_t* bytes, size_t elf_file_size, char const* file_name)
 	return true;
 }
 
-int parse_file(const char *file_name)
-{
-	int fd = open(file_name, O_RDWR);
-	if (fd < 0) {
+struct FileMapping {
+	uint8_t* bytes = nullptr;
+	size_t size = 0;
+
+#ifdef _WIN32
+	HANDLE hFile = INVALID_HANDLE_VALUE;
+	HANDLE hMap = NULL;
+#else
+	int fd = -1;
+#endif
+};
+
+#ifdef _WIN32
+
+static void print_win32_error(const char* what, const char* file_name) {
+	DWORD err = GetLastError();
+	fprintf(stderr, "%s: %s failed for '%s' (GetLastError=%lu)\n",
+	        PACKAGE_NAME, what, file_name, (unsigned long)err);
+}
+
+static bool open_map_rw(const char* file_name, FileMapping& fm) {
+	fm.hFile = CreateFileA(file_name, GENERIC_READ | GENERIC_WRITE,
+	                       FILE_SHARE_READ, NULL, OPEN_EXISTING,
+	                       FILE_ATTRIBUTE_NORMAL, NULL);
+	if (fm.hFile == INVALID_HANDLE_VALUE) {
+		print_win32_error("CreateFile", file_name);
+		return false;
+	}
+
+	LARGE_INTEGER liSize;
+	if (!GetFileSizeEx(fm.hFile, &liSize)) {
+		print_win32_error("GetFileSizeEx", file_name);
+		CloseHandle(fm.hFile);
+		fm.hFile = INVALID_HANDLE_VALUE;
+		return false;
+	}
+	fm.size = (size_t) liSize.QuadPart;
+
+	fm.hMap = CreateFileMappingA(fm.hFile, NULL, PAGE_READWRITE, 0, 0, NULL);
+	if (!fm.hMap) {
+		print_win32_error("CreateFileMapping", file_name);
+		CloseHandle(fm.hFile);
+		fm.hFile = INVALID_HANDLE_VALUE;
+		return false;
+	}
+
+	void* view = MapViewOfFile(fm.hMap, FILE_MAP_WRITE, 0, 0, 0);
+	if (!view) {
+		print_win32_error("MapViewOfFile", file_name);
+		CloseHandle(fm.hMap);
+		fm.hMap = NULL;
+		CloseHandle(fm.hFile);
+		fm.hFile = INVALID_HANDLE_VALUE;
+		return false;
+	}
+
+	fm.bytes = reinterpret_cast<uint8_t*>(view);
+	return true;
+}
+
+static bool flush_and_close(FileMapping& fm, const char* file_name) {
+	bool ok = true;
+
+	if (fm.bytes) {
+		if (!FlushViewOfFile(fm.bytes, 0)) {
+			print_win32_error("FlushViewOfFile", file_name);
+			ok = false;
+		}
+		if (!UnmapViewOfFile(fm.bytes)) {
+			print_win32_error("UnmapViewOfFile", file_name);
+			ok = false;
+		}
+		fm.bytes = nullptr;
+	}
+
+	if (fm.hMap) {
+		if (!CloseHandle(fm.hMap)) {
+			print_win32_error("CloseHandle(mapping)", file_name);
+			ok = false;
+		}
+		fm.hMap = NULL;
+	}
+
+	if (fm.hFile != INVALID_HANDLE_VALUE) {
+		if (!FlushFileBuffers(fm.hFile)) {
+			print_win32_error("FlushFileBuffers", file_name);
+			ok = false;
+		}
+		if (!CloseHandle(fm.hFile)) {
+			print_win32_error("CloseHandle(file)", file_name);
+			ok = false;
+		}
+		fm.hFile = INVALID_HANDLE_VALUE;
+	}
+
+	fm.size = 0;
+	return ok;
+}
+
+#else  // !_WIN32 (POSIX)
+
+static bool open_map_rw(const char* file_name, FileMapping& fm) {
+	fm.fd = open(file_name, O_RDWR);
+	if (fm.fd < 0) {
 		char* error_message;
 		if (asprintf(&error_message, "open(\"%s\")", file_name) == -1)
 			error_message = (char*) "open()";
 		perror(error_message);
-		return 1;
+		return false;
 	}
 
 	struct stat st;
-	if (fstat(fd, &st) < 0) {
+	if (fstat(fm.fd, &st) < 0) {
 		perror("fstat()");
-		if (close(fd) != 0)
-			perror("close()");
-		return 1;
+		close(fm.fd);
+		fm.fd = -1;
+		return false;
 	}
 
-	if (st.st_size < (long long) sizeof(Elf32_Ehdr)) {
-		if (close(fd) != 0) {
-			perror("close()");
-			return 1;
-		}
-		return 0;
-	}
-
-	void* mem = mmap(0, st.st_size, PROT_READ | PROT_WRITE,
-			 MAP_SHARED, fd, 0);
-	if (mem == MAP_FAILED) {
+	fm.size = (size_t) st.st_size;
+	fm.bytes = (uint8_t*) mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fm.fd, 0);
+	if (fm.bytes == MAP_FAILED) {
 		perror("mmap()");
-		if (close(fd) != 0)
-			perror("close()");
-		return 1;
+		close(fm.fd);
+		fm.fd = -1;
+		fm.bytes = nullptr;
+		return false;
 	}
 
-	uint8_t* bytes = reinterpret_cast<uint8_t*>(mem);
+	return true;
+}
+
+static bool flush_and_close(FileMapping& fm, const char* /*file_name*/) {
+	bool ok = true;
+
+	if (fm.bytes) {
+		if (msync(fm.bytes, fm.size, MS_SYNC) < 0) {
+			perror("msync()");
+			ok = false;
+		}
+		munmap(fm.bytes, fm.size);
+		fm.bytes = nullptr;
+	}
+
+	if (fm.fd >= 0) {
+		if (close(fm.fd) != 0) {
+			perror("close()");
+			ok = false;
+		}
+		fm.fd = -1;
+	}
+
+	fm.size = 0;
+	return ok;
+}
+
+#endif
+
+static int parse_mapped(uint8_t* bytes, size_t elf_file_size, const char* file_name)
+{
+	if (elf_file_size < (size_t) sizeof(Elf32_Ehdr))
+		return 0;
+
 	if (!(bytes[0] == 0x7F && bytes[1] == 'E' &&
 	      bytes[2] == 'L' && bytes[3] == 'F')) {
 		// Not the ELF magic number.
-		munmap(mem, st.st_size);
-		if (close(fd) != 0) {
-			perror("close()");
-			return 1;
-		}
 		return 0;
 	}
 
 	if (bytes[/*EI_DATA*/5] != 1) {
 		fprintf(stderr, "%s: Not little endianness in '%s'\n",
 			PACKAGE_NAME, file_name);
-		munmap(mem, st.st_size);
-		if (close(fd) != 0) {
-			perror("close()");
-			return 1;
-		}
 		return 0;
 	}
 
 	uint8_t const bit_value = bytes[/*EI_CLASS*/4];
 	if (bit_value == 1) {
 		if (!process_elf<Elf32_Word, Elf32_Ehdr, Elf32_Shdr, Elf32_Phdr,
-		    Elf32_Dyn>(bytes, st.st_size, file_name)) {
-			munmap(mem, st.st_size);
-			if (close(fd) != 0)
-				perror("close()");
+		    Elf32_Dyn>(bytes, elf_file_size, file_name)) {
 			return 1;
 		}
 	} else if (bit_value == 2) {
-		if (!process_elf<Elf64_Xword, Elf64_Ehdr, Elf64_Shdr,
-		    Elf64_Phdr, Elf64_Dyn>(bytes, st.st_size, file_name)) {
-			munmap(mem, st.st_size);
-			if (close(fd) != 0)
-				perror("close()");
+		if (!process_elf<Elf64_Word, Elf64_Ehdr, Elf64_Shdr, Elf64_Phdr,
+		    Elf64_Dyn>(bytes, elf_file_size, file_name)) {
 			return 1;
 		}
 	} else {
 		fprintf(stderr, "%s: Incorrect bit value %d in '%s'\n",
 			PACKAGE_NAME, bit_value, file_name);
-		munmap(mem, st.st_size);
-		if (close(fd) != 0)
-			perror("close()");
 		return 1;
 	}
 
-	if (msync(mem, st.st_size, MS_SYNC) < 0) {
-		perror("msync()");
-		munmap(mem, st.st_size);
-		if (close(fd) != 0)
-			perror("close()");
-		return 1;
-	}
-
-	munmap(mem, st.st_size);
-	close(fd);
 	return 0;
+}
+
+int parse_file(const char *file_name)
+{
+	FileMapping fm;
+	if (!open_map_rw(file_name, fm))
+		return 1;
+
+	int rc = parse_mapped(fm.bytes, fm.size, file_name);
+
+	if (!flush_and_close(fm, file_name) && rc == 0)
+		rc = 1;
+
+	return rc;
 }
 
 int main(int argc, char **argv)
