@@ -19,48 +19,38 @@ You should have received a copy of the GNU General Public License
 along with termux-elf-cleaner.  If not, see
 <https://www.gnu.org/licenses/>.  */
 
-#include <algorithm>
-#include <cstdint>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <fcntl.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
-#ifdef _WIN32
-# define NOMINMAX
-# include <windows.h>
-#else
-# include <fcntl.h>
-# include <sys/mman.h>
-# include <sys/stat.h>
-# include <sys/types.h>
-# include <unistd.h>
-#endif
-
-#include "arghandling.h"
+#include <algorithm>
+#include <future>
+#include <semaphore>
+#include <thread>
+#include <vector>
 
 // Include a local elf.h copy as not all platforms have it.
 #include "elf.h"
 
-#define DT_GNU_HASH 0x6ffffef5
-#define DT_VERSYM 0x6ffffff0
-#define DT_FLAGS_1 0x6ffffffb
-#define DT_VERNEEDED 0x6ffffffe
-#define DT_VERNEEDNUM 0x6fffffff
-
-#define DT_AARCH64_BTI_PLT 0x70000001
-#define DT_AARCH64_PAC_PLT 0x70000003
-#define DT_AARCH64_VARIANT_PCS 0x70000005
-
-#define DF_1_NOW	0x00000001	/* Set RTLD_NOW for this object.  */
-#define DF_1_GLOBAL	0x00000002	/* Set RTLD_GLOBAL for this object.  */
-#define DF_1_NODELETE	0x00000008	/* Set RTLD_NODELETE for this object.*/
+/* Taken from emacs */
+#define ARRAYELTS(arr) (sizeof (arr) / sizeof (arr)[0])
 
 /* Default to api level 21 unless arg --api-level given  */
 uint8_t supported_dt_flags_1 = (DF_1_NOW | DF_1_GLOBAL);
 int api_level = 21;
 
-bool dry_run = false;
-bool quiet = false;
+int dry_run = 0;
+int quiet = 0;
 
 static char const *const usage_message[] =
 { "\
@@ -71,6 +61,7 @@ dynamic section entries which the Android linker warns about.\n\
 Options:\n\
 \n\
 --api-level NN        choose target api level, i.e. 21, 24, ..\n\
+--jobs N              run parallel on n thread(s).\n\
 --dry-run             print info but but do not remove entries\n\
 --quiet               do not print info about removed entries\n\
 --help                display this help and exit\n\
@@ -156,7 +147,7 @@ bool process_elf(uint8_t* bytes, size_t elf_file_size, char const* file_name)
 				switch (dynamic_section_entry->d_tag) {
 					case DT_GNU_HASH: if (api_level < 23) removed_name = "DT_GNU_HASH"; break;
 					case DT_VERSYM: if (api_level < 23) removed_name = "DT_VERSYM"; break;
-					case DT_VERNEEDED: if (api_level < 23) removed_name = "DT_VERNEEDED"; break;
+					case DT_VERNEED: if (api_level < 23) removed_name = "DT_VERNEED"; break;
 					case DT_VERNEEDNUM: if (api_level < 23) removed_name = "DT_VERNEEDNUM"; break;
 					case DT_VERDEF: if (api_level < 23) removed_name = "DT_VERDEF"; break;
 					case DT_VERDEFNUM: if (api_level < 23) removed_name = "DT_VERDEFNUM"; break;
@@ -171,10 +162,11 @@ bool process_elf(uint8_t* bytes, size_t elf_file_size, char const* file_name)
 						printf("%s: Removing the %s dynamic section entry from '%s'\n",
 						       PACKAGE_NAME, removed_name, file_name);
 					// Tag the entry with DT_NULL and put it last:
-					if (!dry_run)
+					if (!dry_run) {
 						dynamic_section_entry->d_tag = DT_NULL;
-					// Decrease j to process new entry index:
-					std::swap(dynamic_section[j--], dynamic_section[last_nonnull_entry_idx--]);
+						// Decrease j to process new entry index:
+						std::swap(dynamic_section[j--], dynamic_section[last_nonnull_entry_idx--]);
+					}
 				} else if (dynamic_section_entry->d_tag == DT_FLAGS_1) {
 					// Remove unsupported DF_1_* flags to avoid linker warnings.
 					decltype(dynamic_section_entry->d_un.d_val) orig_d_val =
@@ -193,14 +185,25 @@ bool process_elf(uint8_t* bytes, size_t elf_file_size, char const* file_name)
 					}
 				}
 			}
-		}
-		else if (api_level < 23 &&
+		} else if (api_level < 23 &&
 			 (section_header_entry->sh_type == SHT_GNU_verdef ||
 			  section_header_entry->sh_type == SHT_GNU_verneed ||
 			  section_header_entry->sh_type == SHT_GNU_versym)) {
 			if (!quiet)
-				printf("%s: Removing version section from '%s'\n",
-				       PACKAGE_NAME, file_name);
+				switch (section_header_entry->sh_type) {
+				case SHT_GNU_verdef:
+					printf("%s: Removing VERDEF section from '%s'\n",
+					       PACKAGE_NAME, file_name);
+					break;
+				case SHT_GNU_verneed:
+					printf("%s: Removing VERNEED section from '%s'\n",
+					       PACKAGE_NAME, file_name);
+					break;
+				case SHT_GNU_versym:
+					printf("%s: Removing VERSYM section from '%s'\n",
+					       PACKAGE_NAME, file_name);
+					break;
+				}
 			if (!dry_run)
 				section_header_entry->sh_type = SHT_NULL;
 		}
@@ -208,253 +211,186 @@ bool process_elf(uint8_t* bytes, size_t elf_file_size, char const* file_name)
 	return true;
 }
 
-struct FileMapping {
-	uint8_t* bytes = nullptr;
-	size_t size = 0;
-
-#ifdef _WIN32
-	HANDLE hFile = INVALID_HANDLE_VALUE;
-	HANDLE hMap = NULL;
-#else
-	int fd = -1;
-#endif
-};
-
-#ifdef _WIN32
-
-static void print_win32_error(const char* what, const char* file_name) {
-	DWORD err = GetLastError();
-	fprintf(stderr, "%s: %s failed for '%s' (GetLastError=%lu)\n",
-	        PACKAGE_NAME, what, file_name, (unsigned long)err);
-}
-
-static bool open_map_rw(const char* file_name, FileMapping& fm) {
-	fm.hFile = CreateFileA(file_name, GENERIC_READ | GENERIC_WRITE,
-	                       FILE_SHARE_READ, NULL, OPEN_EXISTING,
-	                       FILE_ATTRIBUTE_NORMAL, NULL);
-	if (fm.hFile == INVALID_HANDLE_VALUE) {
-		print_win32_error("CreateFile", file_name);
-		return false;
-	}
-
-	LARGE_INTEGER liSize;
-	if (!GetFileSizeEx(fm.hFile, &liSize)) {
-		print_win32_error("GetFileSizeEx", file_name);
-		CloseHandle(fm.hFile);
-		fm.hFile = INVALID_HANDLE_VALUE;
-		return false;
-	}
-	fm.size = (size_t) liSize.QuadPart;
-
-	fm.hMap = CreateFileMappingA(fm.hFile, NULL, PAGE_READWRITE, 0, 0, NULL);
-	if (!fm.hMap) {
-		print_win32_error("CreateFileMapping", file_name);
-		CloseHandle(fm.hFile);
-		fm.hFile = INVALID_HANDLE_VALUE;
-		return false;
-	}
-
-	void* view = MapViewOfFile(fm.hMap, FILE_MAP_WRITE, 0, 0, 0);
-	if (!view) {
-		print_win32_error("MapViewOfFile", file_name);
-		CloseHandle(fm.hMap);
-		fm.hMap = NULL;
-		CloseHandle(fm.hFile);
-		fm.hFile = INVALID_HANDLE_VALUE;
-		return false;
-	}
-
-	fm.bytes = reinterpret_cast<uint8_t*>(view);
-	return true;
-}
-
-static bool flush_and_close(FileMapping& fm, const char* file_name) {
-	bool ok = true;
-
-	if (fm.bytes) {
-		if (!FlushViewOfFile(fm.bytes, 0)) {
-			print_win32_error("FlushViewOfFile", file_name);
-			ok = false;
-		}
-		if (!UnmapViewOfFile(fm.bytes)) {
-			print_win32_error("UnmapViewOfFile", file_name);
-			ok = false;
-		}
-		fm.bytes = nullptr;
-	}
-
-	if (fm.hMap) {
-		if (!CloseHandle(fm.hMap)) {
-			print_win32_error("CloseHandle(mapping)", file_name);
-			ok = false;
-		}
-		fm.hMap = NULL;
-	}
-
-	if (fm.hFile != INVALID_HANDLE_VALUE) {
-		if (!FlushFileBuffers(fm.hFile)) {
-			print_win32_error("FlushFileBuffers", file_name);
-			ok = false;
-		}
-		if (!CloseHandle(fm.hFile)) {
-			print_win32_error("CloseHandle(file)", file_name);
-			ok = false;
-		}
-		fm.hFile = INVALID_HANDLE_VALUE;
-	}
-
-	fm.size = 0;
-	return ok;
-}
-
-#else  // !_WIN32 (POSIX)
-
-static bool open_map_rw(const char* file_name, FileMapping& fm) {
-	fm.fd = open(file_name, O_RDWR);
-	if (fm.fd < 0) {
+int parse_file(const char *file_name)
+{
+	int fd = open(file_name, O_RDWR);
+	if (fd < 0) {
 		char* error_message;
 		if (asprintf(&error_message, "open(\"%s\")", file_name) == -1)
 			error_message = (char*) "open()";
 		perror(error_message);
-		return false;
+		return 1;
 	}
 
 	struct stat st;
-	if (fstat(fm.fd, &st) < 0) {
+	if (fstat(fd, &st) < 0) {
 		perror("fstat()");
-		close(fm.fd);
-		fm.fd = -1;
-		return false;
-	}
-
-	fm.size = (size_t) st.st_size;
-	fm.bytes = (uint8_t*) mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fm.fd, 0);
-	if (fm.bytes == MAP_FAILED) {
-		perror("mmap()");
-		close(fm.fd);
-		fm.fd = -1;
-		fm.bytes = nullptr;
-		return false;
-	}
-
-	return true;
-}
-
-static bool flush_and_close(FileMapping& fm, const char* /*file_name*/) {
-	bool ok = true;
-
-	if (fm.bytes) {
-		if (msync(fm.bytes, fm.size, MS_SYNC) < 0) {
-			perror("msync()");
-			ok = false;
-		}
-		munmap(fm.bytes, fm.size);
-		fm.bytes = nullptr;
-	}
-
-	if (fm.fd >= 0) {
-		if (close(fm.fd) != 0) {
+		if (close(fd) != 0)
 			perror("close()");
-			ok = false;
-		}
-		fm.fd = -1;
+		return 1;
 	}
 
-	fm.size = 0;
-	return ok;
-}
-
-#endif
-
-static int parse_mapped(uint8_t* bytes, size_t elf_file_size, const char* file_name)
-{
-	if (elf_file_size < (size_t) sizeof(Elf32_Ehdr))
+	if (st.st_size < (long long) sizeof(Elf32_Ehdr)) {
+		if (close(fd) != 0) {
+			perror("close()");
+			return 1;
+		}
 		return 0;
+	}
 
+	void* mem = mmap(0, st.st_size, PROT_READ | PROT_WRITE,
+			 MAP_SHARED, fd, 0);
+	if (mem == MAP_FAILED) {
+		perror("mmap()");
+		if (close(fd) != 0)
+			perror("close()");
+		return 1;
+	}
+
+	uint8_t* bytes = reinterpret_cast<uint8_t*>(mem);
 	if (!(bytes[0] == 0x7F && bytes[1] == 'E' &&
 	      bytes[2] == 'L' && bytes[3] == 'F')) {
 		// Not the ELF magic number.
+		munmap(mem, st.st_size);
+		if (close(fd) != 0) {
+			perror("close()");
+			return 1;
+		}
 		return 0;
 	}
 
 	if (bytes[/*EI_DATA*/5] != 1) {
 		fprintf(stderr, "%s: Not little endianness in '%s'\n",
 			PACKAGE_NAME, file_name);
+		munmap(mem, st.st_size);
+		if (close(fd) != 0) {
+			perror("close()");
+			return 1;
+		}
 		return 0;
 	}
 
 	uint8_t const bit_value = bytes[/*EI_CLASS*/4];
 	if (bit_value == 1) {
 		if (!process_elf<Elf32_Word, Elf32_Ehdr, Elf32_Shdr, Elf32_Phdr,
-		    Elf32_Dyn>(bytes, elf_file_size, file_name)) {
+		    Elf32_Dyn>(bytes, st.st_size, file_name)) {
+			munmap(mem, st.st_size);
+			if (close(fd) != 0)
+				perror("close()");
 			return 1;
 		}
 	} else if (bit_value == 2) {
-		if (!process_elf<Elf64_Word, Elf64_Ehdr, Elf64_Shdr, Elf64_Phdr,
-		    Elf64_Dyn>(bytes, elf_file_size, file_name)) {
+		if (!process_elf<Elf64_Xword, Elf64_Ehdr, Elf64_Shdr,
+		    Elf64_Phdr, Elf64_Dyn>(bytes, st.st_size, file_name)) {
+			munmap(mem, st.st_size);
+			if (close(fd) != 0)
+				perror("close()");
 			return 1;
 		}
 	} else {
 		fprintf(stderr, "%s: Incorrect bit value %d in '%s'\n",
 			PACKAGE_NAME, bit_value, file_name);
+		munmap(mem, st.st_size);
+		if (close(fd) != 0)
+			perror("close()");
 		return 1;
 	}
 
-	return 0;
-}
-
-int parse_file(const char *file_name)
-{
-	FileMapping fm;
-	if (!open_map_rw(file_name, fm))
+	if (msync(mem, st.st_size, MS_SYNC) < 0) {
+		perror("msync()");
+		munmap(mem, st.st_size);
+		if (close(fd) != 0)
+			perror("close()");
 		return 1;
+	}
 
-	int rc = parse_mapped(fm.bytes, fm.size, file_name);
-
-	if (!flush_and_close(fm, file_name) && rc == 0)
-		rc = 1;
-
-	return rc;
+	munmap(mem, st.st_size);
+	close(fd);
+	return 0;
 }
 
 int main(int argc, char **argv)
 {
-	int skip_args = 0;
-	if (argc == 1 || argmatch(argv, argc, "-help", "--help", 3, NULL, &skip_args)) {
+	int c;
+	int options_index = 0;
+	int threads_count = std::thread::hardware_concurrency();
+
+	static struct option options[] = {
+		{"api-level", required_argument, NULL, 'a'},
+		{"dry-run", no_argument, &dry_run, 1},
+		{"jobs", required_argument, NULL, 'j'},
+		{"quiet", no_argument, &quiet, 1},
+		{"help", no_argument, NULL, 'h'},
+		{"version", no_argument, NULL, 'v'},
+		{0, 0, 0, 0}
+	};
+
+	while (true)
+	{
+		c = getopt_long(argc, argv, "hva:dqj:",
+				options, &options_index);
+
+		if (c == -1)
+			break;
+
+		switch (c) {
+		case 'a':
+			api_level = atoi(optarg);
+			if (api_level <= 0)
+				api_level = 21;
+			break;
+		case 'j':
+			threads_count = atoi(optarg);
+			if (threads_count < 1)
+				threads_count = 1;
+			break;
+		case 'v':
+			printf("%s %s\n", PACKAGE_NAME, PACKAGE_VERSION);
+			printf(("%s\n"
+				"%s comes with ABSOLUTELY NO WARRANTY.\n"
+				"You may redistribute copies of %s\n"
+				"under the terms of the GNU General Public License.\n"
+				"For more information about these matters, "
+				"see the file named COPYING.\n"),
+				COPYRIGHT, PACKAGE_NAME, PACKAGE_NAME);
+			return 0;
+		case 'h':
+			printf("Usage: %s [OPTION-OR-FILENAME]...\n", argv[0]);
+			for (unsigned int i = 0; i < ARRAYELTS(usage_message); i++)
+				fputs(usage_message[i], stdout);
+			return 0;
+		}
+	}
+
+	if (optind >= argc) {
 		printf("Usage: %s [OPTION-OR-FILENAME]...\n", argv[0]);
 		for (unsigned int i = 0; i < ARRAYELTS(usage_message); i++)
 			fputs(usage_message[i], stdout);
 		return 0;
 	}
 
-	if (argmatch(argv, argc, "-version", "--version", 3, NULL, &skip_args)) {
-		printf("%s %s\n", PACKAGE_NAME, PACKAGE_VERSION);
-		printf(("%s\n"
-			"%s comes with ABSOLUTELY NO WARRANTY.\n"
-			"You may redistribute copies of %s\n"
-			"under the terms of the GNU General Public License.\n"
-			"For more information about these matters, "
-			"see the file named COPYING.\n"),
-			COPYRIGHT, PACKAGE_NAME, PACKAGE_NAME);
-		return 0;
-	}
-
-	argmatch(argv, argc, "-api-level", "--api-level", 3, &api_level, &skip_args);
+	int files_count = argc - (optind);
+	if (argc - (optind) <= threads_count)
+		threads_count = files_count;
 
 	if (api_level >= 23) {
 		// The supported DT_FLAGS_1 values as of Android 6.0.
 		supported_dt_flags_1 = (DF_1_NOW | DF_1_GLOBAL | DF_1_NODELETE);
 	}
 
-	if (argmatch(argv, argc, "-dry-run", "--dry-run", 3, NULL, &skip_args))
-		dry_run = true;
+	std::vector<std::future<void>> futures;
+	std::counting_semaphore sem(threads_count);
 
-	if (argmatch(argv, argc, "-quiet", "--quiet", 3, NULL, &skip_args))
-		quiet = true;
-
-	for (int i = skip_args+1; i < argc; i++) {
-		if (parse_file(argv[i]) != 0)
-			return 1;
+	for (int i = optind; i < argc; i++) {
+		sem.acquire();
+		const char* file = argv[i];
+		futures.push_back(std::async([file, &sem]() {
+			parse_file(file);
+			sem.release();
+		}));
 	}
+
+	for (auto& future : futures) future.get();
+
 	return 0;
 }
