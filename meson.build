@@ -10,6 +10,7 @@ add_project_arguments('-DPACKAGE_NAME="termux-elf-cleaner"',
 
 elf_cleaner = executable('termux-elf-cleaner', 'elf-cleaner.cpp',
   dependencies : dependency('threads'),
+  override_options : ['cpp_std=c++20'],
   install : true,
 )
 
